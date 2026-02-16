@@ -1,7 +1,6 @@
 import os
 import threading
 import logging
-import re
 
 from flask import Flask
 
@@ -40,10 +39,10 @@ def db_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set. Add it in Render env.")
 
-    # Render env иногда сохраняет пробел/перенос — чистим
+    # Чистим пробелы/переносы (Render env иногда добавляет)
     dsn = (DATABASE_URL or "").strip()
 
-    # Принудительно dbname=postgres, чтобы не ломалось от невидимых символов
+    # На всякий: принудительно dbname=postgres, чтобы не ломалось от '\n'
     return psycopg2.connect(dsn, sslmode="require", dbname="postgres")
 
 def init_db():
@@ -174,7 +173,6 @@ def user_tag(m: Message) -> str:
     uid = u.id if u else 0
     return f"{username} | id={uid} | {full_name}"
 
-
 # ===================== ADMIN/DEBUG COMMANDS =====================
 @dp.message(F.text == "/whoami")
 async def whoami(m: Message):
@@ -234,49 +232,77 @@ async def on_topic(cb: CallbackQuery, state: FSMContext):
     )
     await cb.answer()
 
-@dp.message(UserFlow.chatting, F.any())
-async def user_message(m: Message, state: FSMContext):
-    if not m.from_user:
-        return
-    if is_banned(m.from_user.id):
-        return
-
-    topic = get_topic(m.from_user.id) or "unknown"
-
+# ===================== CORE FORWARD (shared) =====================
+async def forward_to_admins(user_msg: Message, topic_code: str):
+    uid = user_msg.from_user.id
     header = (
         "📩 **Новое сообщение**\n"
-        f"Тема: **{topic_name(topic)}**\n"
-        f"От: `{user_tag(m)}`\n\n"
+        f"Тема: **{topic_name(topic_code)}**\n"
+        f"От: `{user_tag(user_msg)}`\n\n"
         "🛠 **Админ-панель:** кнопки ниже (Ответить / Бан)"
     )
 
     any_sent = False
-
     for admin_id in ADMINS:
         try:
-            banned_flag = is_banned(m.from_user.id)
-
+            banned_flag = is_banned(uid)
             sent_header = await bot.send_message(
                 admin_id,
                 header,
                 parse_mode="Markdown",
-                reply_markup=admin_actions_kb(m.from_user.id, banned_flag)
+                reply_markup=admin_actions_kb(uid, banned_flag)
             )
-            save_admin_map(admin_id, sent_header.message_id, m.from_user.id, topic)
+            save_admin_map(admin_id, sent_header.message_id, uid, topic_code)
 
-            # сообщение юзера — ответом на заголовок с кнопками
-            copied = await m.copy_to(admin_id, reply_to_message_id=sent_header.message_id)
-            save_admin_map(admin_id, copied.message_id, m.from_user.id, topic)
+            copied = await user_msg.copy_to(admin_id, reply_to_message_id=sent_header.message_id)
+            save_admin_map(admin_id, copied.message_id, uid, topic_code)
 
             any_sent = True
         except Exception as e:
             logging.exception(f"Failed to send to admin {admin_id}: {e}")
 
     if any_sent:
-        await m.answer("✅ Принято. Жди ответа админа.")
+        await user_msg.answer("✅ Принято. Жди ответа админа.")
     else:
-        # почти всегда это значит: админы не нажали /start у бота в личке
-        await m.answer("⚠️ Не смог отправить админам. Пусть админы нажмут /start у бота в личке.")
+        await user_msg.answer("⚠️ Не смог отправить админам. Пусть админы нажмут /start у бота в личке.")
+
+@dp.message(UserFlow.chatting, F.any())
+async def user_message(m: Message, state: FSMContext):
+    if not m.from_user:
+        return
+    if is_banned(m.from_user.id):
+        return
+    topic = get_topic(m.from_user.id) or "unknown"
+    await forward_to_admins(m, topic)
+
+# ===================== FALLBACK (если FSM слетел после перезапуска) =====================
+@dp.message(F.any())
+async def fallback_forward(m: Message, state: FSMContext):
+    if not m.from_user:
+        return
+
+    uid = m.from_user.id
+
+    # админов не трогаем (у них свои хендлеры)
+    if uid in ADMINS:
+        return
+
+    # забаненных игнор
+    if is_banned(uid):
+        return
+
+    # Если FSM активен и chatting — обработает user_message
+    cur_state = await state.get_state()
+    if cur_state == UserFlow.chatting.state:
+        return
+
+    # Если тема в БД уже есть — шлем админам даже без FSM
+    topic = get_topic(uid)
+    if not topic:
+        await m.answer("Нажми /start и выбери тему, потом напиши сообщение.")
+        return
+
+    await forward_to_admins(m, topic)
 
 # ===================== ADMIN CALLBACKS =====================
 @dp.callback_query(F.data.startswith("admin:"))
@@ -326,6 +352,7 @@ async def admin_cb(cb: CallbackQuery):
         await cb.answer("Неизвестное действие.", show_alert=True)
 
 # ===================== ADMIN REPLY ROUTING =====================
+# 1) Админ отвечает reply'ем на любое сообщение из треда — бот найдёт user_id по admin_map
 @dp.message(F.reply_to_message)
 async def admin_reply_by_reply(m: Message):
     if not m.from_user:
@@ -349,6 +376,7 @@ async def admin_reply_by_reply(m: Message):
     except Exception:
         await m.answer("❌ Не смог отправить (возможно, пользователь заблокировал бота).")
 
+# 2) Админ нажал кнопку "Ответить" — следующее сообщение уйдет пользователю
 @dp.message(F.any())
 async def admin_reply_by_mode(m: Message):
     if not m.from_user:
@@ -377,7 +405,7 @@ async def admin_reply_by_mode(m: Message):
 async def main():
     init_db()
 
-    # важно: убрать webhook, чтобы не было конфликтов и потерь апдейтов
+    # убираем webhook, чтобы не было конфликтов
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
