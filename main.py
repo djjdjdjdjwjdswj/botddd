@@ -174,6 +174,36 @@ def user_tag(m: Message) -> str:
     uid = u.id if u else 0
     return f"{username} | id={uid} | {full_name}"
 
+
+# ===================== ADMIN/DEBUG COMMANDS =====================
+@dp.message(F.text == "/whoami")
+async def whoami(m: Message):
+    if not m.from_user:
+        return
+    uid = m.from_user.id
+    uname = f"@{m.from_user.username}" if m.from_user.username else "(без username)"
+    is_admin = uid in ADMINS
+    await m.answer(f"Ваш id: {uid}\nusername: {uname}\nadmin: {is_admin}")
+
+@dp.message(F.text == "/testadmins")
+async def testadmins(m: Message):
+    if not m.from_user:
+        return
+    if m.from_user.id not in ADMINS:
+        await m.answer("Нет доступа.")
+        return
+
+    ok = []
+    bad = []
+    for aid in ADMINS:
+        try:
+            await bot.send_message(aid, f"✅ Тест: бот может писать админу {aid}")
+            ok.append(str(aid))
+        except Exception as e:
+            bad.append(f"{aid} ({type(e).__name__})")
+
+    await m.answer("OK: " + (", ".join(ok) if ok else "-") + "\nFAIL: " + (", ".join(bad) if bad else "-"))
+
 # ===================== USER FLOW =====================
 @dp.message(CommandStart())
 async def on_start(m: Message, state: FSMContext):
