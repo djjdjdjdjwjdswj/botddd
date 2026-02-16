@@ -1,6 +1,5 @@
 import os
 import logging
-import asyncio
 from threading import Thread
 from flask import Flask
 
@@ -8,7 +7,6 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -23,6 +21,8 @@ log = logging.getLogger(__name__)
 
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+
+# айди админов как у тебя
 ADMINS = {8243127223, 6334413055}
 
 # user_id -> topic_code (пока не отправил 1 сообщение)
@@ -58,7 +58,6 @@ def _col_exists(cur, table: str, col: str) -> bool:
 def init_db():
     with db_conn() as conn:
         with conn.cursor() as cur:
-            # users
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
@@ -68,7 +67,6 @@ def init_db():
                 );
             """)
 
-            # bans (миграции)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bans (
                     user_id BIGINT PRIMARY KEY,
@@ -77,11 +75,9 @@ def init_db():
                     banned_at TIMESTAMPTZ DEFAULT now()
                 );
             """)
-            # если старая таблица без is_banned — добавим
             if not _col_exists(cur, "bans", "is_banned"):
                 cur.execute("ALTER TABLE bans ADD COLUMN is_banned BOOLEAN NOT NULL DEFAULT TRUE;")
 
-            # tickets
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS tickets (
                     ticket_id BIGSERIAL PRIMARY KEY,
@@ -148,11 +144,10 @@ def resolve_user_id(value: str) -> int | None:
                 cur.execute("SELECT user_id FROM users WHERE lower(username)=%s LIMIT 1;", (uname,))
                 row = cur.fetchone()
                 return int(row["user_id"]) if row else None
-    else:
-        try:
-            return int(v)
-        except:
-            return None
+    try:
+        return int(v)
+    except:
+        return None
 
 def create_ticket(user_id: int, topic_code: str, message_text: str | None, src_chat_id: int, src_message_id: int) -> int:
     with db_conn() as conn:
@@ -198,7 +193,6 @@ def admin_kb(ticket_id: int):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
-
     u = update.message.from_user
     upsert_user(u.id, u.username, u.full_name)
 
@@ -287,14 +281,12 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /ban <id|@username> [причина]")
         return
 
-    target_raw = context.args[0]
-    reason = " ".join(context.args[1:]).strip() or "не указана"
-
-    target_id = resolve_user_id(target_raw)
+    target_id = resolve_user_id(context.args[0])
     if not target_id:
         await update.message.reply_text("Не нашёл пользователя. По @username работает только если он уже писал боту.")
         return
 
+    reason = " ".join(context.args[1:]).strip() or "не указана"
     ban_user(target_id, admin_id, reason)
     await update.message.reply_text(f"✅ Забанен: {target_id}\nПричина: {reason}")
 
@@ -340,71 +332,81 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"🚫 Вы заблокированы.\nПричина: {reason or 'не указана'}")
         return
 
-    # ===== ADMIN REPLY MODE =====
+    # ===== ADMIN REPLY MODE (ответ одним сообщением) =====
     if u.id in ADMINS and u.id in reply_mode:
         info = reply_mode.pop(u.id)
         target_id = info["user_id"]
         ticket_id = info["ticket_id"]
         tcode = info["topic_code"]
 
-        header = f"✅ Ответ по заявке #{ticket_id}\nТема: {topic_text(tcode)}"
+        answer_text = (msg.text or "").strip()
+        if not answer_text:
+            await msg.reply_text("❌ Ответ должен быть текстом.")
+            return
+
+        out = (
+            f"✅ Ответ по заявке #{ticket_id}\n"
+            f"Тема: {topic_text(tcode)}\n\n"
+            f"{answer_text}"
+        )
         try:
-            await context.bot.send_message(target_id, header)
-            await context.bot.copy_message(
-                chat_id=target_id,
-                from_chat_id=msg.chat_id,
-                message_id=msg.message_id,
-            )
+            await context.bot.send_message(target_id, out)
             await msg.reply_text("✅ Ответ отправлен.")
         except:
             await msg.reply_text("❌ Не смог отправить (возможно пользователь заблокировал бота).")
         return
 
-    # ===== USER SENDS TICKET =====
+    # ===== USER SENDS TICKET (1 сообщение) =====
     if u.id not in user_topics:
         await msg.reply_text("Нажми /start и выбери тему.")
         return
 
-    topic_code = user_topics.pop(u.id)  # только 1 сообщение
+    topic_code = user_topics.pop(u.id)  # только 1 сообщение за раз
 
-    text_for_db = msg.text if msg.text else None
     ticket_id = create_ticket(
         user_id=u.id,
         topic_code=topic_code,
-        message_text=text_for_db,
+        message_text=msg.text if msg.text else None,
         src_chat_id=msg.chat_id,
         src_message_id=msg.message_id
     )
 
     username = f"@{u.username}" if u.username else u.full_name
 
-    card = (
+    # ВОТ ТУТ: текст заявки в ЭТОМ ЖЕ сообщении
+    ticket_text = ""
+    if msg.text:
+        ticket_text = msg.text
+    elif msg.caption:
+        ticket_text = msg.caption
+    else:
+        ticket_text = "(медиа)"
+
+    admin_text = (
         f"🔔 Заявка #{ticket_id}\n\n"
         f"👤 {username} (ID: {u.id})\n"
-        f"📝 Тема: {topic_text(topic_code)}"
+        f"📝 Тема: {topic_text(topic_code)}\n\n"
+        f"{ticket_text}"
     )
 
     for admin_id in ADMINS:
         try:
-            await context.bot.send_message(admin_id, card, reply_markup=admin_kb(ticket_id))
-            await context.bot.copy_message(
-                chat_id=admin_id,
-                from_chat_id=msg.chat_id,
-                message_id=msg.message_id
-            )
+            await context.bot.send_message(admin_id, admin_text, reply_markup=admin_kb(ticket_id))
         except Exception as e:
             log.error(f"send to admin {admin_id} failed: {e}")
 
     await msg.reply_text(f"✅ Заявка #{ticket_id} отправлена. Жди ответа.")
 
 # ================= Main =================
-async def run_bot():
+def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
 
     init_db()
+
+    Thread(target=run_flask, daemon=True).start()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -414,34 +416,12 @@ async def run_bot():
 
     application.add_handler(CallbackQueryHandler(on_topic, pattern=r"^topic:(ads|error|other)$"))
     application.add_handler(CallbackQueryHandler(admin_buttons, pattern=r"^(reply|ban):\d+$"))
+
+    # ловим любые сообщения (только текст нужен для ответа админа, заявка может быть текст/медиа)
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_any_message))
 
-    # polling с защитой от 409
-    while True:
-        try:
-            await application.initialize()
-            await application.start()
-            await application.updater.start_polling(drop_pending_updates=True)
-            await application.updater.idle()
-            break
-        except Conflict:
-            log.error("409 Conflict: другой polling уже запущен. Жду 5 секунд и пробую снова...")
-            try:
-                await application.stop()
-            except:
-                pass
-            try:
-                await application.shutdown()
-            except:
-                pass
-            await asyncio.sleep(5)
-        except Exception as e:
-            log.exception(f"FATAL: {e}")
-            await asyncio.sleep(3)
-
-def main():
-    Thread(target=run_flask, daemon=True).start()
-    asyncio.run(run_bot())
+    # ВАЖНО: run_polling сам управляет старт/стоп, иначе и вылезает "already running"
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
