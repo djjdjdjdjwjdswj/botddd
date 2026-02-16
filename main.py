@@ -75,6 +75,40 @@ def init_db():
                     banned_at TIMESTAMPTZ DEFAULT now()
                 );
             """)
+
+            # миграции (если таблица уже была создана старым кодом)
+            if not _col_exists(cur, "bans", "is_banned"):
+                cur.execute("ALTER TABLE bans ADD COLUMN is_banned BOOLEAN NOT NULL DEFAULT TRUE;")
+            if not _col_exists(cur, "bans", "banned_by"):
+                cur.execute("ALTER TABLE bans ADD COLUMN banned_by BIGINT;")
+            if not _col_exists(cur, "bans", "banned_at"):
+                cur.execute("ALTER TABLE bans ADD COLUMN banned_at TIMESTAMPTZ DEFAULT now();")
+            if not _col_exists(cur, "bans", "reason"):
+                cur.execute("ALTER TABLE bans ADD COLUMN reason TEXT;")
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tickets (
+                    ticket_id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    topic_code TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    message_text TEXT,
+                    src_chat_id BIGINT NOT NULL,
+                    src_message_id BIGINT NOT NULL
+                );
+            """)
+
+        conn.commit()
+
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bans (
+                    user_id BIGINT PRIMARY KEY,
+                    reason TEXT,
+                    banned_by BIGINT,
+                    banned_at TIMESTAMPTZ DEFAULT now()
+                );
+            """)
             if not _col_exists(cur, "bans", "is_banned"):
                 cur.execute("ALTER TABLE bans ADD COLUMN is_banned BOOLEAN NOT NULL DEFAULT TRUE;")
 
