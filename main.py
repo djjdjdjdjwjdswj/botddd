@@ -237,7 +237,7 @@ async def user_message(m: Message, state: FSMContext):
         except Exception as e:
             logging.exception(f"Failed to send to admin {admin_id}: {e}")
 
-    await m.answer("✅ Отправлено. Если хочешь — пиши ещё.")
+    await m.answer("✅ Принято. Жди ответа админа.")
 
 # ======= ADMIN CALLBACKS (inline buttons) =======
 @dp.callback_query(F.data.startswith("admin:"))
