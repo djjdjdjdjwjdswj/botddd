@@ -1,8 +1,7 @@
 import os
-import re
 import threading
 import logging
-from datetime import datetime
+import re
 
 from flask import Flask
 
@@ -10,16 +9,16 @@ import psycopg2
 import psycopg2.extras
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ===================== CONFIG =====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8588762559:AAFWqAeXCFZzexak4-Shey_yXVtSaGdqoos")
-DATABASE_URL = os.getenv("DATABASE_URL")  # Supabase Postgres connection string
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_IN_RENDER_ENV")
+DATABASE_URL = os.getenv("DATABASE_URL")  # set in Render env
 
 ADMINS = {6334413055, 8243127223}
 
@@ -39,14 +38,12 @@ def run_flask():
 # ===================== DB (Supabase Postgres) =====================
 def db_conn():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set. Add it in Render env (Supabase Postgres URI).")
+        raise RuntimeError("DATABASE_URL is not set. Add it in Render env.")
 
-    # Render env иногда сохраняет переносы/пробелы в конце — чистим
+    # Render env иногда сохраняет пробел/перенос — чистим
     dsn = (DATABASE_URL or "").strip()
 
-    # На всякий: если в конце случайно есть пробелы/переносы после dbname
-    # и если dbname в url сломан — зададим явно
-    # psycopg2 умеет принимать и URL, и "key=value" параметры
+    # Принудительно dbname=postgres, чтобы не ломалось от невидимых символов
     return psycopg2.connect(dsn, sslmode="require", dbname="postgres")
 
 def init_db():
@@ -139,12 +136,18 @@ def get_mapped_user(admin_chat_id: int, admin_msg_id: int) -> int | None:
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# админ нажал "Ответить" -> сюда кладём, кому следующую месагу отправлять (в памяти)
+# админ нажал "Ответить" -> следующее сообщение уйдет этому юзеру
 admin_reply_target: dict[int, int] = {}
 
 class UserFlow(StatesGroup):
     choosing = State()
     chatting = State()
+
+def admin_only(user_id: int) -> bool:
+    return user_id in ADMINS
+
+def topic_name(code: str) -> str:
+    return {"ads": "Насчет рекламы", "bug": "Замечена ошибка", "other": "Другое"}.get(code, code)
 
 def start_kb():
     kb = InlineKeyboardBuilder()
@@ -153,12 +156,6 @@ def start_kb():
     kb.button(text="3) Другое", callback_data="topic:other")
     kb.adjust(1)
     return kb.as_markup()
-
-def topic_name(code: str) -> str:
-    return {"ads": "Насчет рекламы", "bug": "Замечена ошибка", "other": "Другое"}.get(code, code)
-
-def admin_only(user_id: int) -> bool:
-    return user_id in ADMINS
 
 def admin_actions_kb(user_id: int, banned: bool):
     kb = InlineKeyboardBuilder()
@@ -172,9 +169,12 @@ def admin_actions_kb(user_id: int, banned: bool):
 
 def user_tag(m: Message) -> str:
     u = m.from_user
-    username = f"@{u.username}" if u.username else "(без username)"
-    return f"{username} | id={u.id} | {u.full_name}"
+    username = f"@{u.username}" if u and u.username else "(без username)"
+    full_name = u.full_name if u else "unknown"
+    uid = u.id if u else 0
+    return f"{username} | id={uid} | {full_name}"
 
+# ===================== USER FLOW =====================
 @dp.message(CommandStart())
 async def on_start(m: Message, state: FSMContext):
     if not m.from_user:
@@ -195,8 +195,11 @@ async def on_topic(cb: CallbackQuery, state: FSMContext):
     code = cb.data.split(":", 1)[1].strip()
     set_topic(cb.from_user.id, code)
     await state.set_state(UserFlow.chatting)
+
     await cb.message.answer(
-        f"Ок, тема: **{topic_name(code)}**.\n\nПиши сообщение(я) — я отправлю админам.\nЧтобы снова выбрать тему: /start",
+        f"Ок, тема: **{topic_name(code)}**.\n\n"
+        "Напиши сообщение — я передам админам.\n"
+        "После этого жди ответа.",
         parse_mode="Markdown"
     )
     await cb.answer()
@@ -214,9 +217,10 @@ async def user_message(m: Message, state: FSMContext):
         "📩 **Новое сообщение**\n"
         f"Тема: **{topic_name(topic)}**\n"
         f"От: `{user_tag(m)}`\n\n"
-        "— — —\n"
         "🛠 **Админ-панель:** кнопки ниже (Ответить / Бан)"
     )
+
+    any_sent = False
 
     for admin_id in ADMINS:
         try:
@@ -230,16 +234,21 @@ async def user_message(m: Message, state: FSMContext):
             )
             save_admin_map(admin_id, sent_header.message_id, m.from_user.id, topic)
 
-            # Копируем сообщение юзера ОТВЕТОМ на заголовок с кнопками
+            # сообщение юзера — ответом на заголовок с кнопками
             copied = await m.copy_to(admin_id, reply_to_message_id=sent_header.message_id)
             save_admin_map(admin_id, copied.message_id, m.from_user.id, topic)
 
+            any_sent = True
         except Exception as e:
             logging.exception(f"Failed to send to admin {admin_id}: {e}")
 
-    await m.answer("✅ Принято. Жди ответа админа.")
+    if any_sent:
+        await m.answer("✅ Принято. Жди ответа админа.")
+    else:
+        # почти всегда это значит: админы не нажали /start у бота в личке
+        await m.answer("⚠️ Не смог отправить админам. Пусть админы нажмут /start у бота в личке.")
 
-# ======= ADMIN CALLBACKS (inline buttons) =======
+# ===================== ADMIN CALLBACKS =====================
 @dp.callback_query(F.data.startswith("admin:"))
 async def admin_cb(cb: CallbackQuery):
     if not cb.from_user:
@@ -256,7 +265,6 @@ async def admin_cb(cb: CallbackQuery):
         return
 
     if action == "ban":
-        # username попробуем взять из чата
         username = None
         try:
             chat = await bot.get_chat(target_uid)
@@ -266,7 +274,6 @@ async def admin_cb(cb: CallbackQuery):
             pass
 
         upsert_ban(target_uid, username, "banned by admin button")
-        # обновим кнопки в сообщении, если возможно
         try:
             await cb.message.edit_reply_markup(reply_markup=admin_actions_kb(target_uid, True))
         except Exception:
@@ -283,14 +290,14 @@ async def admin_cb(cb: CallbackQuery):
 
     elif action == "reply":
         admin_reply_target[cb.from_user.id] = target_uid
-        await cb.answer("Ок. Напиши следующее сообщение — я отправлю пользователю.", show_alert=True)
+        await cb.answer("Ок. Следующее сообщение отправлю пользователю.", show_alert=True)
 
     else:
         await cb.answer("Неизвестное действие.", show_alert=True)
 
-# ======= ADMIN: reply-by-reply (как раньше) =======
+# ===================== ADMIN REPLY ROUTING =====================
 @dp.message(F.reply_to_message)
-async def admin_reply_router(m: Message):
+async def admin_reply_by_reply(m: Message):
     if not m.from_user:
         return
     if not admin_only(m.from_user.id):
@@ -303,18 +310,17 @@ async def admin_reply_router(m: Message):
         return
 
     if is_banned(user_id):
-        await m.answer("Этот пользователь забанен — ответ не отправлен.")
+        await m.answer("Пользователь забанен — не отправил.")
         return
 
     try:
         await m.copy_to(user_id)
-        await m.answer("✅ Ответ отправлен пользователю.")
+        await m.answer("✅ Отправлено пользователю.")
     except Exception:
         await m.answer("❌ Не смог отправить (возможно, пользователь заблокировал бота).")
 
-# ======= ADMIN: "Ответить" кнопкой (без reply) =======
 @dp.message(F.any())
-async def admin_send_without_reply(m: Message):
+async def admin_reply_by_mode(m: Message):
     if not m.from_user:
         return
     if not admin_only(m.from_user.id):
@@ -322,7 +328,7 @@ async def admin_send_without_reply(m: Message):
 
     target_uid = admin_reply_target.get(m.from_user.id)
     if not target_uid:
-        return  # не в режиме "ответить кнопкой"
+        return
 
     if is_banned(target_uid):
         admin_reply_target.pop(m.from_user.id, None)
@@ -331,14 +337,22 @@ async def admin_send_without_reply(m: Message):
 
     try:
         await m.copy_to(target_uid)
-        await m.answer("✅ Отправил пользователю. (Режим ответа выключен)")
+        await m.answer("✅ Отправлено пользователю.")
     except Exception:
         await m.answer("❌ Не смог отправить (возможно, пользователь заблокировал бота).")
     finally:
         admin_reply_target.pop(m.from_user.id, None)
 
+# ===================== RUN =====================
 async def main():
     init_db()
+
+    # важно: убрать webhook, чтобы не было конфликтов и потерь апдейтов
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
     threading.Thread(target=run_flask, daemon=True).start()
     await dp.start_polling(bot)
 
