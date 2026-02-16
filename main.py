@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://...
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()  # postgresql://...
 ADMINS = {8243127223, 6334413055}
 
 # user_id -> topic_code (пока не отправил 1 сообщение)
