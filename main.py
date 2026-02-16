@@ -3,6 +3,9 @@ import logging
 from threading import Thread
 from flask import Flask
 
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -14,131 +17,409 @@ from telegram.ext import (
 )
 
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
-TOKEN = os.getenv("BOT_TOKEN")
-
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://...
 ADMINS = {8243127223, 6334413055}
 
-user_topics = {}
-reply_mode = {}
+# user_id -> topic_code (пока не отправил 1 сообщение)
+user_topics: dict[int, str] = {}
 
-# ================= FLASK =================
+# admin_id -> dict(user_id, ticket_id, topic_code)
+reply_mode: dict[int, dict] = {}
 
+# ================= Flask =================
 app = Flask(__name__)
 
-@app.route("/")
+@app.get("/")
 def home():
-    return "Bot running!"
+    return "ok", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-# ================= START =================
+# ================= DB =================
+def db_conn():
+    # Supabase обычно требует SSL
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Насчет рекламы", callback_data="ads")],
-        [InlineKeyboardButton("Замечена ошибка", callback_data="error")],
-        [InlineKeyboardButton("Другое", callback_data="other")]
-    ]
+def init_db():
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    full_name TEXT,
+                    updated_at TIMESTAMPTZ DEFAULT now()
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bans (
+                    user_id BIGINT PRIMARY KEY,
+                    is_banned BOOLEAN NOT NULL DEFAULT TRUE,
+                    reason TEXT,
+                    banned_by BIGINT,
+                    banned_at TIMESTAMPTZ DEFAULT now()
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tickets (
+                    ticket_id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    topic_code TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    message_text TEXT,
+                    src_chat_id BIGINT NOT NULL,
+                    src_message_id BIGINT NOT NULL
+                );
+            """)
+        conn.commit()
 
-    await update.message.reply_text(
-        "Привет!\nВыберите тему обращения:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+def upsert_user(user_id: int, username: str | None, full_name: str | None):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (user_id, username, full_name, updated_at)
+                VALUES (%s, %s, %s, now())
+                ON CONFLICT (user_id)
+                DO UPDATE SET username = EXCLUDED.username,
+                              full_name = EXCLUDED.full_name,
+                              updated_at = now();
+            """, (user_id, username, full_name))
+        conn.commit()
 
-# ================= КНОПКИ =================
+def is_banned(user_id: int) -> tuple[bool, str | None]:
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT is_banned, reason FROM bans WHERE user_id=%s;", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                return False, None
+            return bool(row["is_banned"]), row.get("reason")
 
-async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+def ban_user(user_id: int, banned_by: int, reason: str | None):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO bans (user_id, is_banned, reason, banned_by, banned_at)
+                VALUES (%s, TRUE, %s, %s, now())
+                ON CONFLICT (user_id)
+                DO UPDATE SET is_banned=TRUE, reason=EXCLUDED.reason, banned_by=EXCLUDED.banned_by, banned_at=now();
+            """, (user_id, reason, banned_by))
+        conn.commit()
 
-    user_topics[query.from_user.id] = query.data
+def unban_user(user_id: int):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO bans (user_id, is_banned, reason, banned_by, banned_at)
+                VALUES (%s, FALSE, NULL, NULL, now())
+                ON CONFLICT (user_id)
+                DO UPDATE SET is_banned=FALSE, reason=NULL, banned_by=NULL, banned_at=now();
+            """, (user_id,))
+        conn.commit()
 
-    await query.edit_message_text(
-        "Напишите сообщение.\nМожете отправить несколько сообщений.\nОжидайте ответа."
-    )
-
-# ================= СООБЩЕНИЯ =================
-
-async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.from_user
-    user_id = user.id
-    username = user.username or "без username"
-    text = update.message.text
-
-    # ===== ЕСЛИ АДМИН ОТВЕЧАЕТ =====
-    if user_id in ADMINS and user_id in reply_mode:
-        target_id = reply_mode[user_id]
+def resolve_user_id(value: str) -> int | None:
+    """
+    value: "123" or "@username"
+    Возвращает user_id если нашли. @username ищем по таблице users (если человек уже писал боту).
+    """
+    v = value.strip()
+    if v.startswith("@"):
+        uname = v[1:].lower()
+        with db_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT user_id FROM users WHERE lower(username)=%s LIMIT 1;", (uname,))
+                row = cur.fetchone()
+                return int(row["user_id"]) if row else None
+    else:
         try:
-            await context.bot.send_message(target_id, text)
-            await update.message.reply_text("Ответ отправлен.")
+            return int(v)
         except:
-            await update.message.reply_text("Ошибка отправки.")
-        del reply_mode[user_id]
-        return
+            return None
 
-    # ===== ОБЫЧНЫЙ ПОЛЬЗОВАТЕЛЬ =====
-    topic = user_topics.get(user_id)
-    if not topic:
-        return
+def create_ticket(user_id: int, topic_code: str, message_text: str | None, src_chat_id: int, src_message_id: int) -> int:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO tickets (user_id, topic_code, message_text, src_chat_id, src_message_id)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING ticket_id;
+            """, (user_id, topic_code, message_text, src_chat_id, src_message_id))
+            tid = cur.fetchone()[0]
+        conn.commit()
+        return int(tid)
 
-    topic_text = {
+def get_ticket(ticket_id: int) -> dict | None:
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM tickets WHERE ticket_id=%s;", (ticket_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+# ================= UI helpers =================
+def topic_text(code: str) -> str:
+    return {
         "ads": "Насчет рекламы",
         "error": "Замечена ошибка",
-        "other": "Другое"
-    }.get(topic, "Не указано")
+        "other": "Другое",
+    }.get(code, "Другое")
 
-    keyboard = [
-        [InlineKeyboardButton("Ответить", callback_data=f"reply_{user_id}")]
-    ]
+def topic_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("1) Насчет рекламы", callback_data="topic:ads")],
+        [InlineKeyboardButton("2) Замечена ошибка", callback_data="topic:error")],
+        [InlineKeyboardButton("3) Другое", callback_data="topic:other")],
+    ])
 
+def admin_kb(ticket_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Ответить", callback_data=f"reply:{ticket_id}")],
+        [InlineKeyboardButton("Бан", callback_data=f"ban:{ticket_id}")],
+    ])
+
+# ================= Handlers =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    u = update.message.from_user
+    upsert_user(u.id, u.username, u.full_name)
+
+    banned, reason = is_banned(u.id)
+    if banned:
+        await update.message.reply_text(f"🚫 Вы заблокированы.\nПричина: {reason or 'не указана'}")
+        return
+
+    await update.message.reply_text(
+        "Привет! Выбери, по какому вопросу пишешь 👇",
+        reply_markup=topic_kb()
+    )
+
+async def on_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    u = q.from_user
+    upsert_user(u.id, u.username, u.full_name)
+
+    banned, reason = is_banned(u.id)
+    if banned:
+        return
+
+    code = q.data.split(":", 1)[1]
+    user_topics[u.id] = code
+
+    await q.edit_message_text(
+        f"Ок, тема: {topic_text(code)}.\n\n"
+        "Напиши ОДНО сообщение — я отправлю админам.\n"
+        "Потом жди ответа."
+    )
+
+async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    admin_id = q.from_user.id
+    if admin_id not in ADMINS:
+        return
+
+    data = q.data
+
+    # ===== reply =====
+    if data.startswith("reply:"):
+        ticket_id = int(data.split(":", 1)[1])
+        t = get_ticket(ticket_id)
+        if not t:
+            await q.message.reply_text("⚠️ Заявка не найдена (возможно перезапуск).")
+            return
+
+        reply_mode[admin_id] = {
+            "user_id": int(t["user_id"]),
+            "ticket_id": ticket_id,
+            "topic_code": t["topic_code"],
+        }
+        await q.message.reply_text(f"✍️ Напиши ответ по заявке #{ticket_id}:")
+        return
+
+    # ===== ban =====
+    if data.startswith("ban:"):
+        ticket_id = int(data.split(":", 1)[1])
+        t = get_ticket(ticket_id)
+        if not t:
+            await q.message.reply_text("⚠️ Заявка не найдена (возможно перезапуск).")
+            return
+
+        target_id = int(t["user_id"])
+        reason = f"бан через заявку #{ticket_id}"
+        ban_user(target_id, admin_id, reason)
+
+        try:
+            await context.bot.send_message(target_id, f"🚫 Вы заблокированы администратором.\nПричина: {reason}")
+        except:
+            pass
+
+        await q.message.reply_text(f"✅ Пользователь (ID {target_id}) заблокирован.")
+        return
+
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    admin_id = update.message.from_user.id
+    if admin_id not in ADMINS:
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /ban <id|@username> [причина]")
+        return
+
+    target_raw = context.args[0]
+    reason = " ".join(context.args[1:]).strip() or "не указана"
+
+    target_id = resolve_user_id(target_raw)
+    if not target_id:
+        await update.message.reply_text("Не нашёл пользователя. По @username работает только если он уже писал боту.")
+        return
+
+    ban_user(target_id, admin_id, reason)
+    await update.message.reply_text(f"✅ Забанен: {target_id}\nПричина: {reason}")
+
+    try:
+        await context.bot.send_message(target_id, f"🚫 Вы заблокированы.\nПричина: {reason}")
+    except:
+        pass
+
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    admin_id = update.message.from_user.id
+    if admin_id not in ADMINS:
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /unban <id|@username>")
+        return
+
+    target_id = resolve_user_id(context.args[0])
+    if not target_id:
+        await update.message.reply_text("Не нашёл пользователя. По @username работает только если он уже писал боту.")
+        return
+
+    unban_user(target_id)
+    await update.message.reply_text(f"✅ Разбанен: {target_id}")
+
+    try:
+        await context.bot.send_message(target_id, "✅ Вас разбанили.")
+    except:
+        pass
+
+async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Принимаем ВСЁ (текст/фото/войс/видео/док/стикер).
+    Логика:
+    - если админ в режиме ответа: шлём юзеру "Ответ по заявке #N" + копируем сообщение админа (любой тип)
+    - если обычный юзер: если выбрал тему -> создаём заявку и отправляем админам карточку + копию исходного сообщения
+    """
+    msg = update.message
+    if not msg:
+        return
+
+    u = msg.from_user
+    upsert_user(u.id, u.username, u.full_name)
+
+    banned, reason = is_banned(u.id)
+    if banned:
+        await msg.reply_text(f"🚫 Вы заблокированы.\nПричина: {reason or 'не указана'}")
+        return
+
+    # ===== ADMIN REPLY MODE (любой тип) =====
+    if u.id in ADMINS and u.id in reply_mode:
+        info = reply_mode.pop(u.id)
+        target_id = info["user_id"]
+        ticket_id = info["ticket_id"]
+        tcode = info["topic_code"]
+
+        header = f"✅ Ответ по заявке #{ticket_id}\nТема: {topic_text(tcode)}"
+        try:
+            await context.bot.send_message(target_id, header)
+            # копируем сообщение админа как есть (текст/файл/войс/стикер...)
+            await context.bot.copy_message(
+                chat_id=target_id,
+                from_chat_id=msg.chat_id,
+                message_id=msg.message_id,
+            )
+            await msg.reply_text("✅ Ответ отправлен пользователю.")
+        except Exception:
+            await msg.reply_text("❌ Не смог отправить (возможно пользователь заблокировал бота).")
+        return
+
+    # ===== USER SENDS TICKET =====
+    if u.id not in user_topics:
+        await msg.reply_text("Нажми /start и выбери тему.")
+        return
+
+    topic_code = user_topics.pop(u.id)  # только 1 сообщение
+
+    # создаём заявку в БД
+    text_for_db = msg.text if msg.text else None
+    ticket_id = create_ticket(
+        user_id=u.id,
+        topic_code=topic_code,
+        message_text=text_for_db,
+        src_chat_id=msg.chat_id,
+        src_message_id=msg.message_id
+    )
+
+    username = f"@{u.username}" if u.username else u.full_name
+
+    card = (
+        f"🔔 Заявка #{ticket_id}\n\n"
+        f"👤 {username} (ID: {u.id})\n"
+        f"📝 Тема: {topic_text(topic_code)}"
+    )
+
+    # админам: сначала карточка + кнопки, потом копия сообщения
     for admin_id in ADMINS:
         try:
             await context.bot.send_message(
                 admin_id,
-                f"📩 Новое сообщение\n\n"
-                f"Тема: {topic_text}\n"
-                f"От: @{username}\n"
-                f"ID: {user_id}\n\n"
-                f"{text}",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                card,
+                reply_markup=admin_kb(ticket_id)
             )
-        except:
-            pass
+            await context.bot.copy_message(
+                chat_id=admin_id,
+                from_chat_id=msg.chat_id,
+                message_id=msg.message_id
+            )
+        except Exception as e:
+            log.error(f"send to admin {admin_id} failed: {e}")
 
-# ================= ОТВЕТ АДМИНА =================
+    await msg.reply_text(f"✅ Заявка #{ticket_id} отправлена. Жди ответа.")
 
-async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if not query.data.startswith("reply_"):
-        return
-
-    target_id = int(query.data.split("_")[1])
-
-    if query.from_user.id not in ADMINS:
-        return
-
-    reply_mode[query.from_user.id] = target_id
-
-    await query.message.reply_text(
-        f"Напишите ответ пользователю (ID {target_id})"
-    )
-
-# ================= MAIN =================
-
+# ================= Main =================
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+
+    init_db()
     Thread(target=run_flask, daemon=True).start()
 
-    application = Application.builder().token(TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(buttons, pattern="^(ads|error|other)$"))
-    application.add_handler(CallbackQueryHandler(admin_reply, pattern="^reply_"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
+    application.add_handler(CommandHandler("ban", ban_cmd))
+    application.add_handler(CommandHandler("unban", unban_cmd))
+
+    application.add_handler(CallbackQueryHandler(on_topic, pattern=r"^topic:(ads|error|other)$"))
+    application.add_handler(CallbackQueryHandler(admin_buttons, pattern=r"^(reply|ban):\d+$"))
+
+    # ловим любой контент (не только текст)
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_any_message))
 
     application.run_polling()
 
