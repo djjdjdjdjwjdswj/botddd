@@ -40,7 +40,14 @@ def run_flask():
 def db_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set. Add it in Render env (Supabase Postgres URI).")
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+    # Render env иногда сохраняет переносы/пробелы в конце — чистим
+    dsn = (DATABASE_URL or "").strip()
+
+    # На всякий: если в конце случайно есть пробелы/переносы после dbname
+    # и если dbname в url сломан — зададим явно
+    # psycopg2 умеет принимать и URL, и "key=value" параметры
+    return psycopg2.connect(dsn, sslmode="require", dbname="postgres")
 
 def init_db():
     with db_conn() as conn:
