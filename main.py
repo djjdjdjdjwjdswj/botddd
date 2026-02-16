@@ -1,144 +1,146 @@
 import os
-import asyncio
-import threading
 import logging
-
+from threading import Thread
 from flask import Flask
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ================= CONFIG =================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMINS = {8243127223, 6334413055}
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 logging.basicConfig(level=logging.INFO)
 
+TOKEN = os.getenv("BOT_TOKEN")
+
+ADMINS = {8243127223, 6334413055}
+
+user_topics = {}
+reply_mode = {}
+
 # ================= FLASK =================
+
 app = Flask(__name__)
 
-@app.get("/")
-def index():
-    return "ok", 200
+@app.route("/")
+def home():
+    return "Bot running!"
 
 def run_flask():
-    port = int(os.getenv("PORT", 10000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-# ================= BOT =================
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
+# ================= START =================
 
-# хранит кому админ отвечает
-admin_reply_mode = {}
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("Насчет рекламы", callback_data="ads")],
+        [InlineKeyboardButton("Замечена ошибка", callback_data="error")],
+        [InlineKeyboardButton("Другое", callback_data="other")]
+    ]
+
+    await update.message.reply_text(
+        "Привет!\nВыберите тему обращения:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 # ================= КНОПКИ =================
 
-def start_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="1) Насчет рекламы", callback_data="topic:ads")
-    kb.button(text="2) Замечена ошибка", callback_data="topic:bug")
-    kb.button(text="3) Другое", callback_data="topic:other")
-    kb.adjust(1)
-    return kb.as_markup()
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-def admin_kb(user_id: int):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✍️ Ответить", callback_data=f"reply:{user_id}")
-    kb.button(text="🚫 Бан", callback_data=f"ban:{user_id}")
-    kb.adjust(2)
-    return kb.as_markup()
+    user_topics[query.from_user.id] = query.data
 
-# ================= СТАРТ =================
-
-@dp.message(F.text == "/start")
-async def start(m: Message):
-    await m.answer("Выбери тему 👇", reply_markup=start_kb())
-
-# ================= ВЫБОР ТЕМЫ =================
-
-@dp.callback_query(F.data.startswith("topic:"))
-async def choose_topic(cb: CallbackQuery):
-    await cb.message.answer("Напиши сообщение — я передам админам.")
-    await cb.answer()
-
-# ================= ОТПРАВКА ЖАЛОБ =================
-
-@dp.message()
-async def forward_to_admins(m: Message):
-
-    if not m.from_user:
-        return
-
-    # если пишет админ — это ответ пользователю
-    if m.from_user.id in ADMINS:
-        target = admin_reply_mode.get(m.from_user.id)
-        if target:
-            try:
-                await bot.send_message(target, m.text)
-                await m.answer("✅ Отправлено пользователю")
-            except:
-                await m.answer("❌ Не удалось отправить")
-            admin_reply_mode.pop(m.from_user.id, None)
-        return
-
-    # обычный пользователь
-    user = m.from_user
-    username = f"@{user.username}" if user.username else "без username"
-
-    header = (
-        "📩 Новое сообщение\n\n"
-        f"👤 {username}\n"
-        f"🆔 {user.id}"
+    await query.edit_message_text(
+        "Напишите сообщение.\nМожете отправить несколько сообщений.\nОжидайте ответа."
     )
 
-    for admin in ADMINS:
+# ================= СООБЩЕНИЯ =================
+
+async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    user_id = user.id
+    username = user.username or "без username"
+    text = update.message.text
+
+    # ===== ЕСЛИ АДМИН ОТВЕЧАЕТ =====
+    if user_id in ADMINS and user_id in reply_mode:
+        target_id = reply_mode[user_id]
         try:
-            await bot.send_message(
-                admin,
-                header,
-                reply_markup=admin_kb(user.id)
+            await context.bot.send_message(target_id, text)
+            await update.message.reply_text("Ответ отправлен.")
+        except:
+            await update.message.reply_text("Ошибка отправки.")
+        del reply_mode[user_id]
+        return
+
+    # ===== ОБЫЧНЫЙ ПОЛЬЗОВАТЕЛЬ =====
+    topic = user_topics.get(user_id)
+    if not topic:
+        return
+
+    topic_text = {
+        "ads": "Насчет рекламы",
+        "error": "Замечена ошибка",
+        "other": "Другое"
+    }.get(topic, "Не указано")
+
+    keyboard = [
+        [InlineKeyboardButton("Ответить", callback_data=f"reply_{user_id}")]
+    ]
+
+    for admin_id in ADMINS:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                f"📩 Новое сообщение\n\n"
+                f"Тема: {topic_text}\n"
+                f"От: @{username}\n"
+                f"ID: {user_id}\n\n"
+                f"{text}",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
+        except:
+            pass
 
-            await m.copy_to(admin)
+# ================= ОТВЕТ АДМИНА =================
 
-        except Exception as e:
-            logging.error(f"Ошибка отправки админу: {e}")
+async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-    await m.answer("✅ Отправлено админам")
-
-# ================= КНОПКИ АДМИНА =================
-
-@dp.callback_query(F.data.startswith("reply:"))
-async def admin_reply(cb: CallbackQuery):
-    if cb.from_user.id not in ADMINS:
+    if not query.data.startswith("reply_"):
         return
 
-    user_id = int(cb.data.split(":")[1])
-    admin_reply_mode[cb.from_user.id] = user_id
+    target_id = int(query.data.split("_")[1])
 
-    await cb.answer("Напиши сообщение — отправлю пользователю", show_alert=True)
-
-@dp.callback_query(F.data.startswith("ban:"))
-async def admin_ban(cb: CallbackQuery):
-    if cb.from_user.id not in ADMINS:
+    if query.from_user.id not in ADMINS:
         return
 
-    user_id = int(cb.data.split(":")[1])
+    reply_mode[query.from_user.id] = target_id
 
-    try:
-        await bot.send_message(user_id, "🚫 Вы были заблокированы администратором.")
-    except:
-        pass
+    await query.message.reply_text(
+        f"Напишите ответ пользователю (ID {target_id})"
+    )
 
-    await cb.answer("Пользователь заблокирован", show_alert=True)
+# ================= MAIN =================
 
-# ================= RUN =================
+def main():
+    Thread(target=run_flask, daemon=True).start()
 
-async def main():
-    threading.Thread(target=run_flask, daemon=True).start()
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    application = Application.builder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(buttons, pattern="^(ads|error|other)$"))
+    application.add_handler(CallbackQueryHandler(admin_reply, pattern="^reply_"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
+
+    application.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
