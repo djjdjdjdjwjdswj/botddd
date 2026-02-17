@@ -32,7 +32,8 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
-ADMINS = {7355737254, 8243127223, 8167127645}
+# ✅ добавил 6334413055
+ADMINS = {7355737254, 8243127223, 8167127645, 6334413055}
 
 TOPICS = {
     "ads": "Насчет рекламы",
@@ -205,7 +206,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🚫 Ты в бане до {until_str}\nПричина: {reason}")
         return
 
-    # сброс юзер-стейта
     context.user_data.pop("topic_code", None)
     context.user_data.pop("awaiting_one_message", None)
     context.user_data.pop("pending_ticket_id", None)
@@ -255,7 +255,6 @@ async def user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"🚫 Ты в бане до {until_str}\nПричина: {reason}")
         return
 
-    # если уже отправил — не даём спамить
     if context.user_data.get("pending_ticket_id"):
         tid = context.user_data["pending_ticket_id"]
         await msg.reply_text(f"✅ Твоя заявка #{tid} уже отправлена. Жди ответа.")
@@ -297,11 +296,7 @@ async def user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=buttons,
                 )
             else:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=header,
-                    parse_mode=ParseMode.HTML,
-                )
+                await context.bot.send_message(chat_id=admin_id, text=header, parse_mode=ParseMode.HTML)
                 await context.bot.copy_message(
                     chat_id=admin_id,
                     from_chat_id=msg.chat_id,
@@ -358,11 +353,6 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    ВАЖНО: теперь админ может быть обычным юзером.
-    Этот хендлер обрабатывает ТОЛЬКО когда админ реально в режиме reply/ban.
-    Иначе он НИЧЕГО не делает, и сообщение уйдет в user_message.
-    """
     admin_id = update.effective_user.id
     if admin_id not in ADMINS:
         return
@@ -370,7 +360,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.user_data.get("admin_mode")
     ticket_id = context.user_data.get("admin_ticket_id")
     if not mode or not ticket_id:
-        return  # <-- ключевой фикс
+        return
 
     msg = update.effective_message
     t = get_ticket(int(ticket_id))
@@ -455,12 +445,12 @@ def build_app() -> Application:
     application.add_handler(CallbackQueryHandler(pick_topic, pattern=r"^topic:"))
     application.add_handler(CallbackQueryHandler(admin_buttons, pattern=r"^admin:"))
 
-    # Админский текстовый — но он теперь не блокирует админа как юзера
+    # ✅ ВАЖНО: block=False, чтобы админ мог быть обычным юзером
     application.add_handler(
-        MessageHandler(filters.Chat(list(ADMINS)) & filters.TEXT & ~filters.COMMAND, admin_text)
+        MessageHandler(filters.Chat(list(ADMINS)) & filters.TEXT & ~filters.COMMAND, admin_text),
+        block=False,
     )
 
-    # Все сообщения (и админов тоже, если admin_text не в режиме) идут сюда
     application.add_handler(
         MessageHandler(filters.ALL & ~filters.COMMAND, user_message)
     )
