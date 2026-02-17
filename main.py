@@ -32,7 +32,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
-# ✅ добавил 6334413055
+# ✅ админы
 ADMINS = {7355737254, 8243127223, 8167127645, 6334413055}
 
 TOPICS = {
@@ -445,12 +445,12 @@ def build_app() -> Application:
     application.add_handler(CallbackQueryHandler(pick_topic, pattern=r"^topic:"))
     application.add_handler(CallbackQueryHandler(admin_buttons, pattern=r"^admin:"))
 
-    # ✅ ВАЖНО: block=False, чтобы админ мог быть обычным юзером
+    # ✅ ВАЖНО: block=False ставится В MessageHandler, а не в add_handler
     application.add_handler(
-        MessageHandler(filters.Chat(list(ADMINS)) & filters.TEXT & ~filters.COMMAND, admin_text),
-        block=False,
+        MessageHandler(filters.Chat(list(ADMINS)) & filters.TEXT & ~filters.COMMAND, admin_text, block=False)
     )
 
+    # потом пользовательские (в т.ч. админы как обычные юзеры)
     application.add_handler(
         MessageHandler(filters.ALL & ~filters.COMMAND, user_message)
     )
