@@ -2,7 +2,7 @@ import os
 import re
 import logging
 import threading
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import psycopg2
 from flask import Flask
@@ -32,7 +32,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
-# админы как ты просил
 ADMINS = {7355737254, 8243127223, 8167127645}
 
 TOPICS = {
@@ -94,24 +93,6 @@ def is_banned(user_id: int):
         conn.commit()
     return False, None, None
 
-def ban_user(user_id: int, seconds: int, reason: str, banned_by: int | None):
-    until_ts = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO bans (user_id, until_ts, reason, banned_by)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (user_id) DO UPDATE
-                SET until_ts=EXCLUDED.until_ts,
-                    reason=EXCLUDED.reason,
-                    banned_by=EXCLUDED.banned_by;
-                """,
-                (user_id, until_ts, reason, banned_by),
-            )
-        conn.commit()
-    return until_ts
-
 def unban_user(user_id: int):
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -158,8 +139,26 @@ def get_ticket(ticket_id: int):
                 """,
                 (ticket_id,),
             )
-            row = cur.fetchone()
-    return row
+            return cur.fetchone()
+
+def add_seconds(dt: datetime, seconds: int) -> datetime:
+    return datetime.fromtimestamp(dt.timestamp() + seconds, tz=timezone.utc)
+
+def ban_user(user_id: int, seconds: int, reason: str, banned_by: int | None):
+    until_ts = add_seconds(datetime.now(timezone.utc), seconds)
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bans (user_id, until_ts, reason, banned_by)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE
+                SET until_ts=EXCLUDED.until_ts, reason=EXCLUDED.reason, banned_by=EXCLUDED.banned_by;
+                """,
+                (user_id, until_ts, reason, banned_by),
+            )
+        conn.commit()
+    return until_ts
 
 # ================== UTILS ==================
 def user_label(u) -> str:
@@ -182,10 +181,7 @@ def parse_duration(s: str):
         return n * 86400, f"{n} д"
     return None, None
 
-def until_str_utc(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
-
-# ================== FLASK (для Render порта) ==================
+# ================== FLASK ==================
 app = Flask(__name__)
 
 @app.get("/")
@@ -200,15 +196,16 @@ def run_flask():
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
 
-# ================== BOT LOGIC ==================
+# ================== BOT ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     banned, reason, until_ts = is_banned(u.id)
     if banned:
-        await update.message.reply_text(f"🚫 Ты в бане до {until_str_utc(until_ts)}\nПричина: {reason}")
+        until_str = until_ts.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        await update.message.reply_text(f"🚫 Ты в бане до {until_str}\nПричина: {reason}")
         return
 
-    # сброс состояния отправки заявки
+    # сброс юзер-стейта
     context.user_data.pop("topic_code", None)
     context.user_data.pop("awaiting_one_message", None)
     context.user_data.pop("pending_ticket_id", None)
@@ -230,7 +227,8 @@ async def pick_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     banned, reason, until_ts = is_banned(u.id)
     if banned:
-        await q.edit_message_text(f"🚫 Ты в бане до {until_str_utc(until_ts)}\nПричина: {reason}")
+        until_str = until_ts.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        await q.edit_message_text(f"🚫 Ты в бане до {until_str}\nПричина: {reason}")
         return
 
     _, code = q.data.split(":", 1)
@@ -242,9 +240,76 @@ async def pick_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting_one_message"] = True
     context.user_data["pending_ticket_id"] = None
 
+    topic_text = TOPICS[code]
     await q.edit_message_text(
-        f"Ок, тема: {TOPICS[code]}.\n\nНапиши сообщение — я передам админам.\nПосле этого жди ответа."
+        f"Ок, тема: {topic_text}.\n\nНапиши ОДНО сообщение — я передам админам.\nПосле этого жди ответа."
     )
+
+async def user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    u = update.effective_user
+
+    banned, reason, until_ts = is_banned(u.id)
+    if banned:
+        until_str = until_ts.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        await msg.reply_text(f"🚫 Ты в бане до {until_str}\nПричина: {reason}")
+        return
+
+    # если уже отправил — не даём спамить
+    if context.user_data.get("pending_ticket_id"):
+        tid = context.user_data["pending_ticket_id"]
+        await msg.reply_text(f"✅ Твоя заявка #{tid} уже отправлена. Жди ответа.")
+        return
+
+    topic_code = context.user_data.get("topic_code")
+    if not context.user_data.get("awaiting_one_message") or not topic_code:
+        await msg.reply_text("Нажми /start и выбери тему.")
+        return
+
+    ticket_id, topic_text = create_ticket(u.id, topic_code, msg.chat_id, msg.message_id)
+    context.user_data["pending_ticket_id"] = ticket_id
+    context.user_data["awaiting_one_message"] = False
+
+    await msg.reply_text(f"✅ Заявка #{ticket_id} отправлена. Жди ответа.")
+
+    header = (
+        f"🔔 <b>Заявка #{ticket_id}</b>\n\n"
+        f"👤 <b>{user_label(u)}</b> (ID: <code>{u.id}</code>)\n"
+        f"📝 <b>Тема:</b> {topic_text}"
+    )
+
+    buttons = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Ответить", callback_data=f"admin:reply:{ticket_id}")],
+            [InlineKeyboardButton("Бан", callback_data=f"admin:ban:{ticket_id}")],
+            [InlineKeyboardButton("Разбан", callback_data=f"admin:unban:{u.id}")],
+        ]
+    )
+
+    for admin_id in ADMINS:
+        try:
+            if msg.text:
+                body = f"{header}\n\n<b>🧾 Текст:</b>\n{msg.text}"
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=body,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=buttons,
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=header,
+                    parse_mode=ParseMode.HTML,
+                )
+                await context.bot.copy_message(
+                    chat_id=admin_id,
+                    from_chat_id=msg.chat_id,
+                    message_id=msg.message_id,
+                    reply_markup=buttons,
+                )
+        except Exception as e:
+            log.warning("Failed to notify admin %s: %s", admin_id, e)
 
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -265,7 +330,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["admin_mode"] = "reply"
         context.user_data["admin_ticket_id"] = ticket_id
-        await q.message.reply_text("✍️ Напиши ответ одним сообщением.")
+        await q.edit_message_text((q.message.text or "") + "\n\n✍️ Напиши ответ одним сообщением.")
         return
 
     if action == "ban":
@@ -276,32 +341,38 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["admin_mode"] = "ban_duration"
         context.user_data["admin_ticket_id"] = ticket_id
-        await q.message.reply_text("⏱ Время бана? (например: 10m, 2h, 3d)")
+        await q.edit_message_text((q.message.text or "") + "\n\n⏱ Время бана? (10m, 2h, 3d)")
         return
 
     if action == "unban":
         user_id = int(arg)
-        unban_user(user_id)
-        await q.message.reply_text("✅ Разбанено.")
         try:
-            await context.bot.send_message(user_id, "✅ Тебя разбанили.")
-        except:
-            pass
+            unban_user(user_id)
+            await q.edit_message_text((q.message.text or "") + "\n\n✅ Разбанено.")
+            try:
+                await context.bot.send_message(user_id, "✅ Тебя разбанили.")
+            except:
+                pass
+        except Exception as e:
+            await q.edit_message_text((q.message.text or "") + f"\n\n❌ Ошибка разбана: {e}")
         return
 
 async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Админ пишет текст после кнопок Ответить/Бан."""
-    msg = update.effective_message
+    """
+    ВАЖНО: теперь админ может быть обычным юзером.
+    Этот хендлер обрабатывает ТОЛЬКО когда админ реально в режиме reply/ban.
+    Иначе он НИЧЕГО не делает, и сообщение уйдет в user_message.
+    """
     admin_id = update.effective_user.id
-
     if admin_id not in ADMINS:
         return
 
     mode = context.user_data.get("admin_mode")
     ticket_id = context.user_data.get("admin_ticket_id")
     if not mode or not ticket_id:
-        return
+        return  # <-- ключевой фикс
 
+    msg = update.effective_message
     t = get_ticket(int(ticket_id))
     if not t:
         await msg.reply_text("Тикет не найден.")
@@ -315,9 +386,12 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         answer = msg.text or ""
         set_ticket_answer(_id, admin_id, answer)
 
-        # пользователю — ОДНИМ сообщением (тема + ответ в этом же сообщении)
         out = f"✅ <b>Ответ по заявке #{_id}</b>\n<b>Тема:</b> {topic_text}\n\n{answer}"
-        await context.bot.send_message(user_id, out, parse_mode=ParseMode.HTML)
+        try:
+            await context.bot.send_message(user_id, out, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            await msg.reply_text(f"❌ Не смог отправить пользователю: {e}")
+            return
 
         await msg.reply_text("✅ Ответ отправлен.")
         context.user_data.pop("admin_mode", None)
@@ -341,99 +415,23 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         readable = context.user_data.get("ban_readable", "")
 
         until_ts = ban_user(user_id, seconds, reason, admin_id)
+        until_str = until_ts.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
 
         try:
             await context.bot.send_message(
                 user_id,
-                f"🚫 Тебя забанили на {readable}\nДо: {until_str_utc(until_ts)}\nПричина: {reason}",
+                f"🚫 Тебя забанили на {readable}\nДо: {until_str}\nПричина: {reason}",
             )
         except:
             pass
 
-        await msg.reply_text(f"✅ Забанено: ID {user_id} на {readable} (до {until_str_utc(until_ts)})")
+        await msg.reply_text(f"✅ Забанено: ID {user_id} на {readable} (до {until_str})")
 
         context.user_data.pop("admin_mode", None)
         context.user_data.pop("admin_ticket_id", None)
         context.user_data.pop("ban_seconds", None)
         context.user_data.pop("ban_readable", None)
         return
-
-async def user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Пользователь пишет 1 сообщение -> создаём заявку и шлём всем админам.
-    ВАЖНО: админ тоже может быть пользователем:
-    - если админ НЕ в admin_mode, его сообщение идёт как заявка
-    - если админ в admin_mode, его сообщение обработает admin_text (выше) и сюда не должно доходить
-    """
-    msg = update.effective_message
-    u = update.effective_user
-
-    # если админ сейчас отвечает/банит — не превращаем это в заявку
-    if u.id in ADMINS and context.user_data.get("admin_mode"):
-        return
-
-    banned, reason, until_ts = is_banned(u.id)
-    if banned:
-        await msg.reply_text(f"🚫 Ты в бане до {until_str_utc(until_ts)}\nПричина: {reason}")
-        return
-
-    # если уже отправил — не даём спамить
-    if context.user_data.get("pending_ticket_id"):
-        tid = context.user_data["pending_ticket_id"]
-        await msg.reply_text(f"✅ Твоя заявка #{tid} уже отправлена. Жди ответа.")
-        return
-
-    topic_code = context.user_data.get("topic_code")
-    if not context.user_data.get("awaiting_one_message") or not topic_code:
-        await msg.reply_text("Нажми /start и выбери тему.")
-        return
-
-    ticket_id, topic_text = create_ticket(u.id, topic_code, msg.chat_id, msg.message_id)
-
-    context.user_data["pending_ticket_id"] = ticket_id
-    context.user_data["awaiting_one_message"] = False
-
-    await msg.reply_text(f"✅ Заявка #{ticket_id} отправлена. Жди ответа.")
-
-    header = (
-        f"🔔 <b>Заявка #{ticket_id}</b>\n\n"
-        f"👤 <b>{user_label(u)}</b> (ID: <code>{u.id}</code>)\n"
-        f"📝 <b>Тема:</b> {topic_text}"
-    )
-
-    buttons = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Ответить", callback_data=f"admin:reply:{ticket_id}")],
-            [InlineKeyboardButton("Бан", callback_data=f"admin:ban:{ticket_id}")],
-            [InlineKeyboardButton("Разбан", callback_data=f"admin:unban:{u.id}")],
-        ]
-    )
-
-    # ПРИХОДИТ ВСЕМ АДМИНАМ (включая того админа, который сам подал заявку) — как ты просил
-    for admin_chat_id in ADMINS:
-        try:
-            if msg.text:
-                body = f"{header}\n\n<b>🧾 Текст:</b>\n{msg.text}"
-                await context.bot.send_message(
-                    chat_id=admin_chat_id,
-                    text=body,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=buttons,
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=admin_chat_id,
-                    text=header,
-                    parse_mode=ParseMode.HTML,
-                )
-                await context.bot.copy_message(
-                    chat_id=admin_chat_id,
-                    from_chat_id=msg.chat_id,
-                    message_id=msg.message_id,
-                    reply_markup=buttons,
-                )
-        except Exception as e:
-            log.warning("Failed to notify admin %s: %s", admin_chat_id, e)
 
 async def testadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for a in ADMINS:
@@ -457,12 +455,12 @@ def build_app() -> Application:
     application.add_handler(CallbackQueryHandler(pick_topic, pattern=r"^topic:"))
     application.add_handler(CallbackQueryHandler(admin_buttons, pattern=r"^admin:"))
 
-    # админские ответы/бан — ловим ТОЛЬКО когда admin_mode включен (см. admin_text)
+    # Админский текстовый — но он теперь не блокирует админа как юзера
     application.add_handler(
         MessageHandler(filters.Chat(list(ADMINS)) & filters.TEXT & ~filters.COMMAND, admin_text)
     )
 
-    # заявки: любой тип сообщений (включая админов, если они НЕ в admin_mode)
+    # Все сообщения (и админов тоже, если admin_text не в режиме) идут сюда
     application.add_handler(
         MessageHandler(filters.ALL & ~filters.COMMAND, user_message)
     )
@@ -471,10 +469,7 @@ def build_app() -> Application:
 
 def main():
     init_db()
-
-    # Flask в фоне (чтобы Render видел порт)
     threading.Thread(target=run_flask, daemon=True).start()
-
     application = build_app()
     application.run_polling(close_loop=False)
 
