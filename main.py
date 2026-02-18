@@ -182,6 +182,31 @@ def parse_duration(s: str):
         return n * 86400, f"{n} д"
     return None, None
 
+def html_escape(s: str) -> str:
+    if s is None:
+        return ""
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+    )
+
+def make_admin_header(ticket_id: int, u, topic_text: str) -> str:
+    return (
+        f"🔔 <b>Заявка #{ticket_id}</b>\n\n"
+        f"👤 <b>{html_escape(user_label(u))}</b> (ID: <code>{u.id}</code>)\n"
+        f"📝 <b>Тема:</b> {html_escape(topic_text)}"
+    )
+
+def admin_buttons(ticket_id: int, user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Ответить", callback_data=f"admin:reply:{ticket_id}")],
+            [InlineKeyboardButton("Бан", callback_data=f"admin:ban:{ticket_id}")],
+            [InlineKeyboardButton("Разбан", callback_data=f"admin:unban:{user_id}")],
+        ]
+    )
+
 # ================== FLASK ==================
 app = Flask(__name__)
 
@@ -206,6 +231,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🚫 Ты в бане до {until_str}\nПричина: {reason}")
         return
 
+    # сброс "пользовательского" состояния (работает и для админов тоже)
     context.user_data.pop("topic_code", None)
     context.user_data.pop("awaiting_one_message", None)
     context.user_data.pop("pending_ticket_id", None)
@@ -242,10 +268,61 @@ async def pick_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     topic_text = TOPICS[code]
     await q.edit_message_text(
-        f"Ок, тема: {topic_text}.\n\nНапиши ОДНО сообщение — я передам админам.\nПосле этого жди ответа."
+        f"Ок, тема: {topic_text}.\n\n"
+        f"Напиши ОДНО сообщение — я передам админам.\n"
+        f"После этого жди ответа."
     )
 
-async def user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_ticket_to_admins(context: ContextTypes.DEFAULT_TYPE, ticket_id: int, topic_text: str, u, msg):
+    header = make_admin_header(ticket_id, u, topic_text)
+    kb = admin_buttons(ticket_id, u.id)
+
+    # 1) Текст
+    if msg.text:
+        text_html = html_escape(msg.text)
+        body = f"{header}\n\n<b>🧾 Текст:</b>\n<blockquote>{text_html}</blockquote>"
+        for admin_id in ADMINS:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=body,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb,
+                )
+            except Exception as e:
+                log.warning("Failed to notify admin %s: %s", admin_id, e)
+        return
+
+    # 2) Фото/видео/голос/док и т.д.
+    caption = getattr(msg, "caption", None)
+    caption_html = html_escape(caption) if caption else ""
+
+    for admin_id in ADMINS:
+        try:
+            # сначала заголовок
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=header,
+                parse_mode=ParseMode.HTML,
+            )
+            # потом копия медиа с кнопками
+            await context.bot.copy_message(
+                chat_id=admin_id,
+                from_chat_id=msg.chat_id,
+                message_id=msg.message_id,
+                reply_markup=kb,
+            )
+            # если есть подпись — кидаем цитатой отдельным сообщением
+            if caption_html:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"<b>🧾 Текст:</b>\n<blockquote>{caption_html}</blockquote>",
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception as e:
+            log.warning("Failed to notify admin %s: %s", admin_id, e)
+
+async def handle_user_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     u = update.effective_user
 
@@ -255,9 +332,9 @@ async def user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"🚫 Ты в бане до {until_str}\nПричина: {reason}")
         return
 
+    # если уже отправил — не даём спамить
     if context.user_data.get("pending_ticket_id"):
-        tid = context.user_data["pending_ticket_id"]
-        await msg.reply_text(f"✅ Твоя заявка #{tid} уже отправлена. Жди ответа.")
+        await msg.reply_text("✅ Уже отправлено. Жди ответа.")
         return
 
     topic_code = context.user_data.get("topic_code")
@@ -266,47 +343,15 @@ async def user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ticket_id, topic_text = create_ticket(u.id, topic_code, msg.chat_id, msg.message_id)
+
+    # ✅ пользователю НЕ показываем номер заявки
     context.user_data["pending_ticket_id"] = ticket_id
     context.user_data["awaiting_one_message"] = False
+    await msg.reply_text("✅ Отправлено. Жди ответа.")
 
-    await msg.reply_text(f"✅ Заявка #{ticket_id} отправлена. Жди ответа.")
+    await send_ticket_to_admins(context, ticket_id, topic_text, u, msg)
 
-    header = (
-        f"🔔 <b>Заявка #{ticket_id}</b>\n\n"
-        f"👤 <b>{user_label(u)}</b> (ID: <code>{u.id}</code>)\n"
-        f"📝 <b>Тема:</b> {topic_text}"
-    )
-
-    buttons = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Ответить", callback_data=f"admin:reply:{ticket_id}")],
-            [InlineKeyboardButton("Бан", callback_data=f"admin:ban:{ticket_id}")],
-            [InlineKeyboardButton("Разбан", callback_data=f"admin:unban:{u.id}")],
-        ]
-    )
-
-    for admin_id in ADMINS:
-        try:
-            if msg.text:
-                body = f"{header}\n\n<b>🧾 Текст:</b>\n{msg.text}"
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=body,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=buttons,
-                )
-            else:
-                await context.bot.send_message(chat_id=admin_id, text=header, parse_mode=ParseMode.HTML)
-                await context.bot.copy_message(
-                    chat_id=admin_id,
-                    from_chat_id=msg.chat_id,
-                    message_id=msg.message_id,
-                    reply_markup=buttons,
-                )
-        except Exception as e:
-            log.warning("Failed to notify admin %s: %s", admin_id, e)
-
-async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     admin_id = q.from_user.id
@@ -352,23 +397,21 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text((q.message.text or "") + f"\n\n❌ Ошибка разбана: {e}")
         return
 
-async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
     admin_id = update.effective_user.id
-    if admin_id not in ADMINS:
-        return
 
     mode = context.user_data.get("admin_mode")
     ticket_id = context.user_data.get("admin_ticket_id")
     if not mode or not ticket_id:
-        return
+        return False  # не обработали
 
-    msg = update.effective_message
     t = get_ticket(int(ticket_id))
     if not t:
         await msg.reply_text("Тикет не найден.")
         context.user_data.pop("admin_mode", None)
         context.user_data.pop("admin_ticket_id", None)
-        return
+        return True
 
     _id, user_id, topic_code, topic_text, status, created_at, src_chat_id, src_message_id = t
 
@@ -376,28 +419,28 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         answer = msg.text or ""
         set_ticket_answer(_id, admin_id, answer)
 
-        out = f"✅ <b>Ответ по заявке #{_id}</b>\n<b>Тема:</b> {topic_text}\n\n{answer}"
+        out = f"✅ <b>Ответ по заявке</b>\n<b>Тема:</b> {html_escape(topic_text)}\n\n{html_escape(answer)}"
         try:
             await context.bot.send_message(user_id, out, parse_mode=ParseMode.HTML)
         except Exception as e:
             await msg.reply_text(f"❌ Не смог отправить пользователю: {e}")
-            return
+            return True
 
         await msg.reply_text("✅ Ответ отправлен.")
         context.user_data.pop("admin_mode", None)
         context.user_data.pop("admin_ticket_id", None)
-        return
+        return True
 
     if mode == "ban_duration":
         seconds, readable = parse_duration(msg.text or "")
         if seconds is None:
             await msg.reply_text("❌ Формат времени: 10m, 2h, 3d")
-            return
+            return True
         context.user_data["admin_mode"] = "ban_reason"
         context.user_data["ban_seconds"] = seconds
         context.user_data["ban_readable"] = readable
         await msg.reply_text("📝 Причина бана? (одним сообщением)")
-        return
+        return True
 
     if mode == "ban_reason":
         reason = msg.text or "без причины"
@@ -421,7 +464,22 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("admin_ticket_id", None)
         context.user_data.pop("ban_seconds", None)
         context.user_data.pop("ban_readable", None)
+        return True
+
+    return False
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # общий хендлер: если админ в режиме — обрабатываем, иначе это обычная заявка
+    u = update.effective_user
+    if not u:
         return
+
+    if u.id in ADMINS:
+        handled = await handle_admin_text(update, context)
+        if handled:
+            return
+
+    await handle_user_ticket(update, context)
 
 async def testadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for a in ADMINS:
@@ -443,17 +501,10 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("testadmins", testadmins))
 
     application.add_handler(CallbackQueryHandler(pick_topic, pattern=r"^topic:"))
-    application.add_handler(CallbackQueryHandler(admin_buttons, pattern=r"^admin:"))
+    application.add_handler(CallbackQueryHandler(admin_buttons_handler, pattern=r"^admin:"))
 
-    # ✅ ВАЖНО: block=False ставится В MessageHandler, а не в add_handler
-    application.add_handler(
-        MessageHandler(filters.Chat(list(ADMINS)) & filters.TEXT & ~filters.COMMAND, admin_text, block=False)
-    )
-
-    # потом пользовательские (в т.ч. админы как обычные юзеры)
-    application.add_handler(
-        MessageHandler(filters.ALL & ~filters.COMMAND, user_message)
-    )
+    # ✅ один-единственный хендлер на сообщения
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
 
     return application
 
